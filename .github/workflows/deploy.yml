@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - master
   workflow_dispatch:
 
 jobs:
@@ -13,22 +14,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-action@stable
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          targets: wasm32-unknown-unknown
+          node-version: '20'
 
-      - name: Install wrangler
-        run: npm install -g wrangler
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add WASM target
+        run: rustup target add wasm32-unknown-unknown
 
       - name: Install worker-build
         run: cargo install worker-build
 
-      - name: Build
+      - name: Build Worker
         run: worker-build --release
 
-      - name: Deploy
+      - name: Deploy to Cloudflare
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: deploy
