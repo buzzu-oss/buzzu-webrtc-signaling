@@ -5,12 +5,23 @@ use worker::*;
 #[serde(tag = "type")]
 pub enum SignalingMessage {
     Join { room_id: String, peer_id: String },
-    Offer { from: String, to: String, sdp: String },
-    Answer { from: String, to: String, sdp: String },
+    Offer { from: String, to: String, #[serde(default)] sdp: Option<String>, #[serde(default)] sdp_compressed: Option<String> },
+    Answer { from: String, to: String, #[serde(default)] sdp: Option<String>, #[serde(default)] sdp_compressed: Option<String> },
     IceCandidate { from: String, to: String, candidate: String },
     PeerList { peers: Vec<String> },
     Leave { peer_id: String },
     Error { message: String },
+    Relay { from: String, to: String, via: String, payload: String, hop_count: u32, timestamp: u64 },
+    RelayRequest { from: String, to: String, target_peer: String },
+    RelayResponse { from: String, to: String, candidates: Vec<RelayCandidate> },
+    Reachability { from: String, reachable_peers: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayCandidate {
+    peer_id: String,
+    rtt_ms: u32,
+    reliability: f32,
 }
 
 #[durable_object]
@@ -66,7 +77,13 @@ impl DurableObject for RoomDurableObject {
             };
             if let Ok(json) = serde_json::to_string(&join_msg) {
                 for ws in &websockets {
-                    let _ = ws.send_with_str(&json);
+                    let other_peer: String = ws.deserialize_attachment::<String>()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    if other_peer != peer_id {
+                        let _ = ws.send_with_str(&json);
+                    }
                 }
             }
             
@@ -89,18 +106,20 @@ impl DurableObject for RoomDurableObject {
         
         if let Ok(msg) = serde_json::from_str::<SignalingMessage>(&text) {
             match msg {
-                SignalingMessage::Offer { to, sdp, .. } => {
+                SignalingMessage::Offer { to, sdp, sdp_compressed, .. } => {
                     self.forward_to_peer(&to, SignalingMessage::Offer { 
                         from: from_peer, 
                         to: to.clone(), 
-                        sdp 
+                        sdp,
+                        sdp_compressed 
                     });
                 }
-                SignalingMessage::Answer { to, sdp, .. } => {
+                SignalingMessage::Answer { to, sdp, sdp_compressed, .. } => {
                     self.forward_to_peer(&to, SignalingMessage::Answer { 
                         from: from_peer, 
                         to: to.clone(), 
-                        sdp 
+                        sdp,
+                        sdp_compressed 
                     });
                 }
                 SignalingMessage::IceCandidate { to, candidate, .. } => {
@@ -109,6 +128,54 @@ impl DurableObject for RoomDurableObject {
                         to: to.clone(), 
                         candidate 
                     });
+                }
+                SignalingMessage::Relay { to, via, payload, hop_count, timestamp, .. } => {
+                    // If sender IS the relay (from == via), forward to target (to)
+                    // Otherwise, forward to relay (via)
+                    let target = if from_peer == via { &to } else { &via };
+                    
+                    self.forward_to_peer(target, SignalingMessage::Relay { 
+                        from: from_peer, 
+                        to: to.clone(), 
+                        via: via.clone(), 
+                        payload, 
+                        hop_count, 
+                        timestamp 
+                    });
+                }
+                SignalingMessage::RelayRequest { to, target_peer, .. } => {
+                    // Forward relay request to the target peer
+                    self.forward_to_peer(&to, SignalingMessage::RelayRequest { 
+                        from: from_peer, 
+                        to: to.clone(), 
+                        target_peer 
+                    });
+                }
+                SignalingMessage::RelayResponse { to, candidates, .. } => {
+                    // Forward relay response to the requesting peer
+                    self.forward_to_peer(&to, SignalingMessage::RelayResponse { 
+                        from: from_peer, 
+                        to: to.clone(), 
+                        candidates 
+                    });
+                }
+                SignalingMessage::Reachability { reachable_peers, .. } => {
+                    // Broadcast reachability to all peers (except sender)
+                    let reach_msg = SignalingMessage::Reachability { 
+                        from: from_peer.clone(), 
+                        reachable_peers 
+                    };
+                    if let Ok(json) = serde_json::to_string(&reach_msg) {
+                        for ws in self.state.get_websockets() {
+                            let other_peer: String = ws.deserialize_attachment::<String>()
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            if other_peer != from_peer {
+                                let _ = ws.send_with_str(&json);
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
